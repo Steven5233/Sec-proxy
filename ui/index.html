@@ -20,6 +20,7 @@
       <span class="badge" id="interceptBadge" style="display:none">0</span>
     </button>
     <button class="mtab" data-tab="repeater">Repeater</button>
+    <button class="mtab" data-tab="comparer">Comparer</button>
     <button class="mtab" data-tab="decoder">Decoder</button>
     <button class="mtab" data-tab="scanner">Scanner</button>
     <button class="mtab" data-tab="settings">Settings</button>
@@ -50,13 +51,14 @@
     </select>
     <button class="btn" onclick="clearHistory()">Clear</button>
     <button class="btn" onclick="exportHAR()">Export HAR</button>
+    <button class="btn" id="histViewBtn" onclick="histToggleView()">🌳 Tree view</button>
   </div>
 
   <div class="hsplit">
     <!-- Left: table -->
     <div class="hist-wrap">
-      <table class="hist-table">
-        <thead><tr>
+      <table class="hist-table" id="histTable">
+        <thead id="histThead"><tr>
           <th style="width:32px">#</th>
           <th style="width:62px">Method</th>
           <th>Host</th>
@@ -108,8 +110,9 @@
 <!-- ══════════════════════════════════════════════════════════
      TAB: REPEATER
 ════════════════════════════════════════════════════════════ -->
-<div class="tab-content" id="tab-repeater">
-  <div class="rsplit">
+<div class="tab-content" id="tab-repeater" style="flex-direction:column;overflow:hidden;">
+  <div class="rep-tabstrip" id="repTabstrip"></div>
+  <div class="rsplit" style="flex:1;min-height:0;">
     <!-- Request panel -->
     <div class="req-panel" id="reqPanel">
       <div class="toolbar" style="border-bottom:1px solid var(--border)">
@@ -224,6 +227,40 @@
 </div>
 
 <!-- ══════════════════════════════════════════════════════════
+     TAB: COMPARER
+════════════════════════════════════════════════════════════ -->
+<div class="tab-content" id="tab-comparer">
+  <div class="toolbar">
+    <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:1px">Word-level diff between two requests/responses</span>
+    <button class="btn accent" onclick="cmpCompare()">⇄ Compare</button>
+    <button class="btn" onclick="cmpClear()">Clear</button>
+  </div>
+  <div class="decoder-wrap" id="cmpInputs">
+    <div class="dec-panel">
+      <div class="toolbar">
+        <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:1px">Left</span>
+        <span class="muted" id="cmpLeftLabel" style="margin-left:auto;font-size:10px"></span>
+      </div>
+      <textarea class="body-ta" id="cmpLeft" placeholder="Paste or send a request/response here (History → Compare L)…" style="flex:1;min-height:160px"></textarea>
+    </div>
+    <div class="dec-panel">
+      <div class="toolbar">
+        <span class="muted" style="font-size:10px;text-transform:uppercase;letter-spacing:1px">Right</span>
+        <span class="muted" id="cmpRightLabel" style="margin-left:auto;font-size:10px"></span>
+      </div>
+      <textarea class="body-ta" id="cmpRight" placeholder="Paste or send a request/response here (History → Compare R)…" style="flex:1;min-height:160px"></textarea>
+    </div>
+  </div>
+  <div id="cmpResultWrap" style="display:none;flex:1;min-height:0;overflow:auto;border-top:1px solid var(--bdr);padding:10px;background:var(--sur);">
+    <div style="display:flex;gap:14px;font-size:10px;margin-bottom:8px;color:var(--text2)">
+      <span><span class="diff-del" style="padding:1px 6px;border-radius:3px">removed</span></span>
+      <span><span class="diff-add" style="padding:1px 6px;border-radius:3px">added</span></span>
+    </div>
+    <pre class="resp-pre" id="cmpResult" style="white-space:pre-wrap"></pre>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════════
      TAB: SCANNER
 ════════════════════════════════════════════════════════════ -->
 <div class="tab-content" id="tab-scanner">
@@ -303,28 +340,25 @@
   <!-- ── Browser top bar ── -->
   <div id="bTopbar" style="
     display:flex;align-items:center;gap:6px;padding:6px 8px;
-    background:#111318;border-bottom:1px solid #2a2d35;flex-shrink:0;">
-    <button type="button" onclick="bGoBack()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">◀</button>
-    <button type="button" onclick="bGoForward()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">▶</button>
-    <button type="button" onclick="bReload()"    style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;border-radius:4px;padding:4px 9px;cursor:pointer;font-size:13px;">↺</button>
+    background:var(--sur);border-bottom:1px solid var(--bdr);flex-shrink:0;">
+    <button type="button" onclick="bGoBack()"    class="btn" style="padding:4px 9px;">◀</button>
+    <button type="button" onclick="bGoForward()" class="btn" style="padding:4px 9px;">▶</button>
+    <button type="button" onclick="bReload()"    class="btn" style="padding:4px 9px;">↺</button>
     <input id="bUrlbar" type="text" placeholder="http://localhost:8080"
       onkeydown="if(event.key==='Enter'){ event.preventDefault(); bNavigate(); }"
       spellcheck="false" autocomplete="off"
-      style="flex:1;background:#1a1d24;border:1px solid #2a2d35;border-radius:6px;
-             color:#e2e8f0;font-size:13px;font-family:monospace;padding:5px 10px;
-             outline:none;min-width:0;"/>
-    <button type="button" onclick="bNavigate()"
-      style="background:#2563eb;border:none;color:#fff;border-radius:6px;
-             padding:5px 14px;cursor:pointer;font-size:13px;font-weight:600;flex-shrink:0;">Go</button>
+      class="url-inp" style="flex:1;min-width:0;"/>
+    <button type="button" onclick="bNavigate()" class="btn accent" style="padding:5px 14px;flex-shrink:0;">Go</button>
+    <button type="button" onclick="bSendToRepeater()" class="btn" title="Send current page to Repeater" style="flex-shrink:0;">⇄ Repeater</button>
   </div>
 
   <!-- ── Browser info bar ── -->
   <div style="
     display:flex;align-items:center;gap:10px;padding:3px 10px;
-    background:#0a0c0f;border-bottom:1px solid #2a2d35;
-    font-size:10px;color:#64748b;flex-shrink:0;">
+    background:var(--sur2);border-bottom:1px solid var(--bdr);
+    font-size:10px;color:var(--text3);flex-shrink:0;">
     <span style="display:flex;align-items:center;gap:4px;">
-      <span id="bCaptureDot" style="width:6px;height:6px;border-radius:50%;background:#22c55e;display:inline-block;"></span>
+      <span id="bCaptureDot" style="width:6px;height:6px;border-radius:50%;background:var(--accent);display:inline-block;"></span>
       Proxy active — no config needed
     </span>
     <span id="bCaptureCount">0 captured</span>
@@ -332,49 +366,47 @@
   </div>
 
   <!-- ── Browser page area ── -->
-  <div id="bPageWrap" style="flex:1;overflow:auto;background:#0a0c0f;position:relative;">
+  <div id="bPageWrap" style="flex:1;overflow:auto;background:var(--bg);position:relative;">
 
     <!-- Welcome -->
     <div id="bWelcome" style="
       position:absolute;inset:0;display:flex;flex-direction:column;
       align-items:center;justify-content:center;gap:14px;
-      background:#0a0c0f;color:#64748b;text-align:center;padding:24px;">
+      background:var(--bg);color:var(--text3);text-align:center;padding:24px;">
       <div style="font-size:28px;">🔍</div>
-      <h2 style="font-size:16px;color:#e2e8f0;letter-spacing:1px;">Built-in Browser</h2>
+      <h2 style="font-size:16px;color:var(--text);letter-spacing:1px;">Built-in Browser</h2>
       <p style="font-size:11px;line-height:1.7;max-width:300px;">
         All traffic is automatically captured.<br>No proxy configuration needed.
       </p>
       <div style="display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin-top:4px;">
-        <span onclick="bGo('http://localhost:8080')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:8080</span>
-        <span onclick="bGo('http://localhost:3000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:3000</span>
-        <span onclick="bGo('http://localhost:5000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:5000</span>
-        <span onclick="bGo('http://localhost:8000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:8000</span>
-        <span onclick="bGo('http://localhost:4000')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:4000</span>
-        <span onclick="bGo('http://localhost:1337')" style="background:#1a1d24;border:1px solid #2a2d35;border-radius:4px;padding:4px 10px;font-size:11px;color:#2563eb;cursor:pointer;">:1337</span>
+        <span onclick="bGo('http://localhost:8080')" class="btn" style="color:var(--accent);cursor:pointer;">:8080</span>
+        <span onclick="bGo('http://localhost:3000')" class="btn" style="color:var(--accent);cursor:pointer;">:3000</span>
+        <span onclick="bGo('http://localhost:5000')" class="btn" style="color:var(--accent);cursor:pointer;">:5000</span>
+        <span onclick="bGo('http://localhost:8000')" class="btn" style="color:var(--accent);cursor:pointer;">:8000</span>
+        <span onclick="bGo('http://localhost:4000')" class="btn" style="color:var(--accent);cursor:pointer;">:4000</span>
+        <span onclick="bGo('http://localhost:1337')" class="btn" style="color:var(--accent);cursor:pointer;">:1337</span>
       </div>
     </div>
 
     <!-- Loading -->
     <div id="bLoadOverlay" style="
-      position:absolute;inset:0;background:#0a0c0f;
+      position:absolute;inset:0;background:var(--bg);
       display:none;flex-direction:column;align-items:center;
-      justify-content:center;gap:12px;font-size:12px;color:#64748b;z-index:10;">
-      <div style="width:28px;height:28px;border:3px solid #2a2d35;border-top-color:#2563eb;
-                  border-radius:50%;animation:spin 0.7s linear infinite;"></div>
+      justify-content:center;gap:12px;font-size:12px;color:var(--text3);z-index:10;">
+      <div class="spinner"></div>
       <span id="bLoadMsg">Fetching…</span>
     </div>
 
     <!-- Error -->
     <div id="bErrorPane" style="
-      position:absolute;inset:0;background:#0a0c0f;
+      position:absolute;inset:0;background:var(--bg);
       display:none;flex-direction:column;align-items:center;
-      justify-content:center;gap:10px;color:#64748b;
+      justify-content:center;gap:10px;color:var(--text3);
       padding:24px;text-align:center;z-index:10;">
-      <h2 style="color:#ef4444;font-size:15px;">⚠ Connection Error</h2>
-      <pre id="bErrorMsg" style="font-size:11px;background:#1a1d24;padding:10px 14px;
+      <h2 style="color:var(--danger);font-size:15px;">⚠ Connection Error</h2>
+      <pre id="bErrorMsg" style="font-size:11px;background:var(--sur2);padding:10px 14px;
            border-radius:6px;max-width:380px;word-break:break-all;white-space:pre-wrap;"></pre>
-      <button onclick="bReload()" style="background:#1a1d24;border:1px solid #2a2d35;color:#e2e8f0;
-              border-radius:4px;padding:5px 14px;cursor:pointer;margin-top:4px;">Try again</button>
+      <button onclick="bReload()" class="btn" style="margin-top:4px;">Try again</button>
     </div>
 
     <!-- Page content injected here -->
@@ -387,7 +419,7 @@
 <script>
 async function downloadCert() {
   try {
-    const res = await fetch("http://127.0.0.1:8080/api/ca.crt");
+    const res = await fetch("/api/ca.crt");
     if (!res.ok) { alert("Cert not ready yet — wait a few seconds and try again"); return; }
     const blob = await res.blob();
     const url  = URL.createObjectURL(blob);
