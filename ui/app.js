@@ -19,6 +19,10 @@ let repRespData = { body:'', headers:'', raw:'' };
 let repRespTab  = 'body';
 let ws          = null;
 let wsTimer     = null;
+let histViewMode = 'list';   // 'list' | 'tree'
+let repTabs      = [];       // multiple independent Repeater tabs
+let repActiveIdx = 0;
+let repTabSeq    = 0;
 
 const MC = { GET:'var(--mget)', POST:'var(--mpost)', PUT:'var(--mput)', DELETE:'var(--mdel)', PATCH:'var(--mpatch)', HEAD:'var(--text2)', OPTIONS:'var(--text2)' };
 
@@ -135,30 +139,73 @@ function applyFilters() {
   histRender();
 }
 
+function histToggleView() {
+  histViewMode = histViewMode === 'list' ? 'tree' : 'list';
+  document.getElementById('histViewBtn').textContent = histViewMode === 'list' ? '🌳 Tree view' : '📋 List view';
+  histRender();
+}
+
+function histBuildRow(r) {
+  const tr = document.createElement('tr');
+  if (r.flagged)    tr.classList.add('flagged');
+  if (r.id === selHistId) tr.classList.add('sel');
+  const sc = r.res_status;
+  const scls = sc ? (sc>=500?'s5':sc>=400?'s4':sc>=300?'s3':'s2') : '';
+  const size = r.res_body ? fmtSize((r.res_body||'').length) : '—';
+  const path = (r.path||'/').slice(0,55);
+  tr.innerHTML = `
+    <td>${r.id}</td>
+    <td class="mc ${r.method}">${r.method}</td>
+    <td title="${esc(r.host||'')}">${esc((r.host||'').replace(/^www\./,''))}</td>
+    <td title="${esc(r.path||'')}">${esc(path)}</td>
+    <td class="${scls}">${sc||'—'}</td>
+    <td>${size}</td>
+    <td>${r.latency_ms!=null?r.latency_ms:'—'}</td>
+    <td><button class="rep-ico" title="→ Repeater" onclick="repLoadFromHist(${r.id},event)">↺</button></td>
+  `;
+  tr.onclick = e => { if (e.target.classList.contains('rep-ico')) return; histSelect(r.id, tr); };
+  return tr;
+}
+
 function histRender() {
   const tbody = document.getElementById('histBody');
   tbody.innerHTML = '';
+  if (histViewMode === 'tree') { histRenderTree(tbody); return; }
+  filtered.forEach(r => tbody.appendChild(histBuildRow(r)));
+}
+
+// Site-map style tree: group history rows by host, collapsible per host —
+// mirrors Burp's Target tab so the built-up map of a target is visible at a glance.
+function histRenderTree(tbody) {
+  const groups = {};
   filtered.forEach(r => {
-    const tr = document.createElement('tr');
-    if (r.flagged)    tr.classList.add('flagged');
-    if (r.id === selHistId) tr.classList.add('sel');
-    const sc = r.res_status;
-    const scls = sc ? (sc>=500?'s5':sc>=400?'s4':sc>=300?'s3':'s2') : '';
-    const size = r.res_body ? fmtSize((r.res_body||'').length) : '—';
-    const path = (r.path||'/').slice(0,55);
-    tr.innerHTML = `
-      <td>${r.id}</td>
-      <td class="mc ${r.method}">${r.method}</td>
-      <td title="${esc(r.host||'')}">${esc((r.host||'').replace(/^www\./,''))}</td>
-      <td title="${esc(r.path||'')}">${esc(path)}</td>
-      <td class="${scls}">${sc||'—'}</td>
-      <td>${size}</td>
-      <td>${r.latency_ms!=null?r.latency_ms:'—'}</td>
-      <td><button class="rep-ico" title="→ Repeater" onclick="repLoadFromHist(${r.id},event)">↺</button></td>
-    `;
-    tr.onclick = e => { if (e.target.classList.contains('rep-ico')) return; histSelect(r.id, tr); };
-    tbody.appendChild(tr);
+    const host = r.host || '(unknown host)';
+    (groups[host] = groups[host] || []).push(r);
   });
+  Object.keys(groups).sort().forEach(host => {
+    const items = groups[host];
+    const gid = 'g_' + host.replace(/[^a-z0-9]/gi, '_');
+    const trh = document.createElement('tr');
+    trh.className = 'host-group';
+    trh.innerHTML = `<td colspan="8" onclick="histToggleGroup('${gid}')" style="cursor:pointer">
+      <span id="${gid}_arrow">▸</span> ${esc(host)}
+      <span class="muted" style="font-weight:400">(${items.length})</span>
+    </td>`;
+    tbody.appendChild(trh);
+    items.forEach(r => {
+      const tr = histBuildRow(r);
+      tr.classList.add(gid);
+      tr.style.display = 'none';
+      tbody.appendChild(tr);
+    });
+  });
+}
+
+function histToggleGroup(gid) {
+  const arrow = document.getElementById(gid + '_arrow');
+  const opening = arrow.textContent === '▸';
+  arrow.textContent = opening ? '▾' : '▸';
+  document.querySelectorAll('.' + gid).forEach(el => { el.style.display = opening ? '' : 'none'; });
 }
 
 async function histSelect(id, tr) {
@@ -211,6 +258,9 @@ async function detailShow(id) {
     <div class="detail-foot">
       <button class="btn accent" onclick="repLoadFromHist(${r.id})">↺ Repeater</button>
       <button class="btn" onclick="copyRaw(${r.id})">Copy Raw</button>
+      <button class="btn" onclick="copyCurl(${r.id})">Copy as curl</button>
+      <button class="btn" onclick="cmpSet('cmpLeft',${r.id})">⇄ Compare L</button>
+      <button class="btn" onclick="cmpSet('cmpRight',${r.id})">⇄ Compare R</button>
       <button class="btn" onclick="saveReq(${r.id})">💾 Save</button>
     </div>`;
 }
@@ -241,6 +291,18 @@ async function copyRaw(id) {
   const r = await api(`/api/requests/${id}`);
   if (!r.error) await navigator.clipboard?.writeText(buildRaw(r));
   toast('Copied!');
+}
+
+async function copyCurl(id) {
+  const r = await api(`/api/requests/${id}`);
+  if (r.error) return toast('Could not load request #' + id);
+  const hdrs = safeJSON(r.req_headers, {});
+  const q = s => `'${String(s).replace(/'/g, `'\\''`)}'`;
+  let cmd = `curl -X ${r.method} ${q(r.url)}`;
+  Object.entries(hdrs).forEach(([k, v]) => { cmd += ` \\\n  -H ${q(k + ': ' + v)}`; });
+  if (r.req_body) cmd += ` \\\n  --data-raw ${q(r.req_body)}`;
+  await navigator.clipboard?.writeText(cmd);
+  toast('curl command copied ✓');
 }
 
 async function saveReq(id) {
@@ -401,7 +463,112 @@ function repColorMethod() {
   const s = document.getElementById('rMethod');
   s.style.color = MC[s.value] || 'var(--text)';
 }
-repColorMethod();
+
+// ── Multi-tab management (Burp-style: several independent Repeater tabs) ──
+function repDefaultState() {
+  return {
+    method:'GET', url:'', bodyType:'json',
+    headers:[{k:'Content-Type',v:'application/json'},{k:'Accept',v:'*/*'}],
+    params:[], cookies:[], fields:[], body:'', resp:null,
+  };
+}
+
+function repTabsInit() {
+  repTabs = [{ id: ++repTabSeq, name: '1', state: repDefaultState() }];
+  repActiveIdx = 0;
+  repApplyState(0);
+  repRenderTabs();
+}
+
+function repRenderTabs() {
+  const strip = document.getElementById('repTabstrip');
+  if (!strip) return;
+  strip.innerHTML = repTabs.map((t, i) => `
+    <div class="rep-tab ${i===repActiveIdx?'active':''}" onclick="repTabSwitch(${i})">
+      <span>${esc(t.name)}</span>
+      ${repTabs.length>1 ? `<span class="rep-tab-close" onclick="event.stopPropagation();repTabClose(${i})">×</span>` : ''}
+    </div>
+  `).join('') + `<button class="rep-tab-add" onclick="repTabNew()" title="New Repeater tab">+</button>`;
+}
+
+function repSaveState(idx) {
+  const t = repTabs[idx];
+  if (!t) return;
+  const s = t.state;
+  s.method   = document.getElementById('rMethod').value;
+  s.url      = document.getElementById('rUrl').value;
+  s.bodyType = repBodyType;
+  s.headers  = kvGet('rHdrTable');
+  s.params   = kvGet('rParTable');
+  s.cookies  = kvGet('rCkTable');
+  s.fields   = kvGet('rFmTable');
+  s.body     = document.getElementById('rBodyTA').value;
+}
+
+function repApplyState(idx) {
+  const t = repTabs[idx];
+  if (!t) return;
+  const s = t.state;
+
+  document.getElementById('rMethod').value = s.method || 'GET';
+  repColorMethod();
+  document.getElementById('rUrl').value = s.url || '';
+
+  document.getElementById('rHdrTable').innerHTML = ''; (s.headers||[]).forEach(h => kvAdd('rHdrTable','rHdr',h.k,h.v)); kvCount('rHdr');
+  document.getElementById('rParTable').innerHTML = ''; (s.params||[]).forEach(h => kvAdd('rParTable','rPar',h.k,h.v)); kvCount('rPar');
+  document.getElementById('rCkTable').innerHTML  = ''; (s.cookies||[]).forEach(h => kvAdd('rCkTable','rCk',h.k,h.v)); kvCount('rCk');
+  document.getElementById('rFmTable').innerHTML  = ''; (s.fields||[]).forEach(h => kvAdd('rFmTable','rFm',h.k,h.v)); kvCount('rFm');
+
+  repBodyType = s.bodyType || 'json';
+  const typeOrder = ['json','form','xml','raw','none'];
+  document.querySelectorAll('.btype').forEach((b,i) => b.classList.toggle('active', typeOrder[i]===repBodyType));
+  const fm = document.getElementById('rFmBody'), ta = document.getElementById('rBodyTA');
+  if (repBodyType==='form') { fm.style.display=''; ta.style.display='none'; }
+  else if (repBodyType==='none') { fm.style.display='none'; ta.style.display='none'; }
+  else { fm.style.display='none'; ta.style.display=''; }
+  ta.value = s.body || '';
+
+  const empty = document.getElementById('resEmpty'), load = document.getElementById('resLoading'),
+        body  = document.getElementById('resBody'),  topbar = document.getElementById('resTopbar');
+  if (s.resp) {
+    repRespData = s.resp.data;
+    empty.style.display = 'none'; load.style.display = 'none'; topbar.style.visibility = 'visible';
+    document.getElementById('rStatusBadge').className = 'status-badge ' + s.resp.cls;
+    document.getElementById('rStatusBadge').textContent = String(s.resp.status||0);
+    document.getElementById('rMeta').innerHTML = s.resp.meta;
+    body.style.display = '';
+    repShowBody();
+  } else {
+    empty.style.display = 'flex'; load.style.display = 'none'; body.style.display = 'none'; topbar.style.visibility = 'hidden';
+  }
+}
+
+function repTabSwitch(idx) {
+  if (idx === repActiveIdx) return;
+  repSaveState(repActiveIdx);
+  repActiveIdx = idx;
+  repApplyState(idx);
+  repRenderTabs();
+}
+
+function repTabNew(prefill) {
+  repSaveState(repActiveIdx);
+  const state = Object.assign(repDefaultState(), prefill || {});
+  repTabs.push({ id: ++repTabSeq, name: String(repTabs.length + 1), state });
+  repActiveIdx = repTabs.length - 1;
+  repApplyState(repActiveIdx);
+  repRenderTabs();
+}
+
+function repTabClose(idx) {
+  if (repTabs.length <= 1) return;
+  repTabs.splice(idx, 1);
+  repTabs.forEach((t,i) => t.name = String(i+1));
+  if (repActiveIdx >= repTabs.length) repActiveIdx = repTabs.length - 1;
+  else if (idx < repActiveIdx) repActiveIdx--;
+  repApplyState(repActiveIdx);
+  repRenderTabs();
+}
 
 function repSetBody(btn, type) {
   document.querySelectorAll('.btype').forEach(b => b.classList.remove('active'));
@@ -455,23 +622,32 @@ async function repSend() {
 
   const r = await api('/api/repeat','POST',{ method, url:finalUrl, headers, body });
 
+  if (repTabs[repActiveIdx]) {
+    try { repTabs[repActiveIdx].name = new URL(finalUrl).host || repTabs[repActiveIdx].name; } catch(_) {}
+    repRenderTabs();
+  }
+
   btn.textContent='▶ Send';
   document.getElementById('resLoading').style.display='none';
   document.getElementById('resTopbar').style.visibility='visible';
 
   const badge = document.getElementById('rStatusBadge');
-  badge.textContent = String(r.status||0);
-  badge.className = 'status-badge';
   const s=r.status||0;
-  if (s>=500) badge.classList.add('s5xx');
-  else if (s>=400) badge.classList.add('s4xx');
-  else if (s>=300) badge.classList.add('s3xx');
-  else badge.classList.add('s2xx');
+  const cls = s>=500?'s5xx':s>=400?'s4xx':s>=300?'s3xx':'s2xx';
+  badge.textContent = String(r.status||0);
+  badge.className = 'status-badge ' + cls;
 
-  document.getElementById('rMeta').innerHTML = `<b>${r.latency}ms</b> · <b>${fmtSize((r.body||'').length)}</b>`;
-  repRespData.body    = colorJSON(r.body||'');
-  repRespData.headers = Object.entries(r.headers||{}).map(([k,v])=>`<span class="jk">${esc(k)}</span>: <span class="js">${esc(String(v))}</span>`).join('\n');
-  repRespData.raw     = `HTTP/1.1 ${r.status}\n`+Object.entries(r.headers||{}).map(([k,v])=>`${k}: ${v}`).join('\n')+'\n\n'+(r.body||'');
+  const meta = `<b>${r.latency}ms</b> · <b>${fmtSize((r.body||'').length)}</b>`;
+  document.getElementById('rMeta').innerHTML = meta;
+  repRespData = {
+    body:    colorJSON(r.body||''),
+    headers: Object.entries(r.headers||{}).map(([k,v])=>`<span class="jk">${esc(k)}</span>: <span class="js">${esc(String(v))}</span>`).join('\n'),
+    raw:     `HTTP/1.1 ${r.status}\n`+Object.entries(r.headers||{}).map(([k,v])=>`${k}: ${v}`).join('\n')+'\n\n'+(r.body||''),
+  };
+  // Persist onto the currently active Repeater tab so switching tabs doesn't lose it
+  if (repTabs[repActiveIdx]) {
+    repTabs[repActiveIdx].state.resp = { status: r.status||0, cls, meta, data: repRespData };
+  }
   repShowBody();
   document.getElementById('resBody').style.display='';
 }
@@ -498,42 +674,32 @@ async function repLoadFromHist(id, e) {
   if (e) { e.stopPropagation(); e.preventDefault(); }
   const r = await api(`/api/requests/${id}`);
   if (r.error) return toast('Could not load request #' + id);
-  document.getElementById('rUrl').value    = r.url || '';
-  document.getElementById('rMethod').value = r.method || 'GET';
-  repColorMethod();
-  // Clear and reload headers
-  document.getElementById('rHdrTable').innerHTML = '';
+
   const hdrs = safeJSON(r.req_headers, {});
-  Object.entries(hdrs).forEach(([k, v]) => kvAdd('rHdrTable', 'rHdr', k, String(v)));
-  kvCount('rHdr');
-  // Load cookies
-  document.getElementById('rCkTable').innerHTML = '';
+  const headers = Object.entries(hdrs).map(([k,v]) => ({ k, v:String(v) }));
+  let cookies = [];
   const cookieHdr = hdrs['cookie'] || hdrs['Cookie'] || '';
   if (cookieHdr) {
-    cookieHdr.split(';').forEach(part => {
+    cookies = cookieHdr.split(';').map(part => {
       const eq = part.indexOf('=');
-      if (eq > 0) kvAdd('rCkTable', 'rCk', part.slice(0, eq).trim(), part.slice(eq + 1).trim());
-    });
-    kvCount('rCk');
+      return eq > 0 ? { k: part.slice(0,eq).trim(), v: part.slice(eq+1).trim() } : null;
+    }).filter(Boolean);
   }
-  // Load body
-  if (r.req_body) {
-    document.getElementById('rBodyTA').value = r.req_body;
-    const ct = (safeJSON(r.req_headers, {})['content-type'] || '').toLowerCase();
-    if (ct.includes('application/json') || !ct) {
-      document.querySelectorAll('.btype').forEach(b => b.classList.remove('active'));
-      document.querySelector('.btype[onclick*="json"]')?.classList.add('active');
-      repBodyType = 'json';
-    } else if (ct.includes('form')) {
-      document.querySelectorAll('.btype').forEach(b => b.classList.remove('active'));
-      document.querySelector('.btype[onclick*="form"]')?.classList.add('active');
-      repBodyType = 'form';
-    }
-  } else {
-    document.getElementById('rBodyTA').value = '';
-  }
+  const ct = (hdrs['content-type'] || '').toLowerCase();
+  const bodyType = ct.includes('form') ? 'form' : 'json';
+
+  repTabNew({
+    method: r.method || 'GET',
+    url: r.url || '',
+    headers, cookies,
+    bodyType,
+    body: r.req_body || '',
+  });
+  try { repTabs[repActiveIdx].name = new URL(r.url).host || ('#'+id); } catch(_) { repTabs[repActiveIdx].name = '#'+id; }
+  repRenderTabs();
+
   showTab('repeater');
-  toast('Loaded into Repeater ✓');
+  toast('Sent to a new Repeater tab ✓');
 }
 
 // ── Resize handle ────────────────────────────────────────────
@@ -599,6 +765,68 @@ function decCopy() {
 function decToRep() {
   document.getElementById('rBodyTA').value = document.getElementById('decOut').textContent;
   showTab('repeater'); toast('Sent to Repeater body');
+}
+
+// ══════════════════════════════════════════════════════════════
+// COMPARER TAB
+// ══════════════════════════════════════════════════════════════
+// LCS-based word/line diff. Falls back to line-level tokens for very
+// large inputs to keep the DP table small enough for a phone's CPU/RAM.
+function diffTokens(a, b) {
+  let ta = a.split(/(\s+)/), tb = b.split(/(\s+)/);
+  if (ta.length > 2500 || tb.length > 2500) { ta = a.split(/(\n)/); tb = b.split(/(\n)/); }
+  const n = ta.length, m = tb.length;
+  const dp = new Array(n + 1);
+  for (let i = 0; i <= n; i++) dp[i] = new Uint16Array(m + 1);
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i][j] = ta[i] === tb[j] ? dp[i+1][j+1] + 1 : Math.max(dp[i+1][j], dp[i][j+1]);
+    }
+  }
+  const out = [];
+  let i = 0, j = 0;
+  while (i < n && j < m) {
+    if (ta[i] === tb[j]) { out.push({ t:'eq', v:ta[i] }); i++; j++; }
+    else if (dp[i+1][j] >= dp[i][j+1]) { out.push({ t:'del', v:ta[i] }); i++; }
+    else { out.push({ t:'add', v:tb[j] }); j++; }
+  }
+  while (i < n) { out.push({ t:'del', v:ta[i] }); i++; }
+  while (j < m) { out.push({ t:'add', v:tb[j] }); j++; }
+  return out;
+}
+
+function cmpCompare() {
+  const a = document.getElementById('cmpLeft').value;
+  const b = document.getElementById('cmpRight').value;
+  if (!a && !b) return toast('Nothing to compare');
+  const ops = diffTokens(a, b);
+  const html = ops.map(o => {
+    const v = esc(o.v);
+    if (o.t === 'eq')  return v;
+    if (o.t === 'del') return `<span class="diff-del">${v}</span>`;
+    return `<span class="diff-add">${v}</span>`;
+  }).join('');
+  document.getElementById('cmpResult').innerHTML = html || '(identical)';
+  document.getElementById('cmpResultWrap').style.display = 'block';
+}
+
+function cmpClear() {
+  document.getElementById('cmpLeft').value = '';
+  document.getElementById('cmpRight').value = '';
+  document.getElementById('cmpLeftLabel').textContent = '';
+  document.getElementById('cmpRightLabel').textContent = '';
+  document.getElementById('cmpResultWrap').style.display = 'none';
+  document.getElementById('cmpResult').innerHTML = '';
+}
+
+async function cmpSet(targetId, id) {
+  const r = await api(`/api/requests/${id}`);
+  if (r.error) return toast('Could not load request #' + id);
+  document.getElementById(targetId).value = buildRaw(r);
+  const labelId = targetId === 'cmpLeft' ? 'cmpLeftLabel' : 'cmpRightLabel';
+  document.getElementById(labelId).textContent = `#${id} ${r.method} ${r.host || ''}`;
+  showTab('comparer');
+  toast('Sent to Comparer ✓');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -794,102 +1022,91 @@ document.addEventListener('keydown', e => {
 });
 
 // ── Init defaults ─────────────────────────────────────────────
-kvAdd('rHdrTable','rHdr','Content-Type','application/json');
-kvAdd('rHdrTable','rHdr','Accept','*/*');
+repTabsInit();
 
 // ── Boot ──────────────────────────────────────────────────────
 wsConnect();
 
 // ══════════════════════════════════════════════════════════════
-//  BUILT-IN BROWSER — complete rewrite
+//  BUILT-IN BROWSER
 //
-//  Architecture:
-//    1. User types URL → bFetchWithOpts() called
-//    2. Fetch goes to /proxy-browse?url=... on ui-server.js
-//    3. ui-server.js routes it through proxy.js:8080 (captured!)
-//    4. Response HTML returned to browser tab
-//    5. bRenderHTML() injects into srcdoc iframe with:
-//       - Correct <base> tag
-//       - Asset URL rewriting (src/href → /proxy-asset?url=...)
-//       - Link/form interception script via postMessage
+//  FIX Bug 23: This whole section previously called endpoints
+//  (/proxy-browse, /proxy-asset) that DO NOT EXIST on the server.
+//  server/ui-server.js was rewritten to a transparent reverse-proxy
+//  engine at /rp/?t=<url> (real origin, real cookies, full asset +
+//  link + form + fetch/XHR rewriting, all handled server-side), but
+//  the front-end here was never updated to match, so every single
+//  navigation in the "Browser" tab 404'd against a dead endpoint.
+//  That is the root cause of the built-in browser not working.
 //
-//  Fixes:
-//  FIX-B3: All asset URLs (img src, link href, script src, CSS url())
-//           rewritten to /proxy-asset?url=... so they load correctly
-//           inside srcdoc iframe (which has no real origin).
-//  FIX-B4: Removed allow-same-origin from iframe sandbox. It was
-//           causing postMessage origin mismatches. The interception
-//           script now uses '*' as the target origin.
-//  FIX-B5: <base> tag deduplication now uses a single reliable inject
-//           that removes ALL existing base tags first, then adds ours.
-//  FIX-B6: Click interception now uses capture phase (true) with
-//           stopPropagation AFTER sending postMessage so sites that
-//           call stopPropagation internally still get intercepted.
-//  FIX-B7: Fetch timeout controller — navigation away from a page
-//           while loading aborts the in-flight fetch so the browser
-//           tab doesn't remain stuck on "loading".
+//  This rewrite simply points a real (non-srcdoc) iframe at
+//  /rp/?t=<url>. Because /rp/ is served from our own origin
+//  (127.0.0.1:UI_PORT), the iframe gets a REAL origin, so cookies,
+//  relative URLs, fetch/XHR, forms, and in-page navigation all work
+//  correctly out of the box — server/ui-server.js already rewrites
+//  every link, form, asset URL, and injects a JS shim that keeps
+//  in-page navigation (fetch/XHR/location/pushState) routed through
+//  /rp/. We no longer need to hand-parse HTML or intercept clicks
+//  via postMessage for navigation; we only listen for the 'rp-title'
+//  message the shim sends so the address bar reflects the real URL.
 // ══════════════════════════════════════════════════════════════
 (function () {
   'use strict';
 
   function el(id) { return document.getElementById(id); }
 
-  let bNavHistory  = [];
-  let bHistIdx     = -1;
-  let bCurrentUrl  = '';
-  let bAbortCtrl   = null;   // FIX-B7: abort controller for in-flight fetch
+  let bNavHistory = [];
+  let bHistIdx    = -1;
+  let bCurrentUrl = '';
 
   // ── Public API ───────────────────────────────────────────────
-  window.bGo        = function(url) { bLoadUrl(url); };
-  window.bNavigate  = function() {
+  window.bGo        = function (url) { bLoadUrl(url); };
+  window.bNavigate  = function () {
     let url = (el('bUrlbar') ? el('bUrlbar').value : '').trim();
     if (!url) return;
     if (!url.startsWith('http://') && !url.startsWith('https://')) url = 'http://' + url;
     bLoadUrl(url);
   };
-  window.bGoBack    = function() { if (bHistIdx > 0)                      { bHistIdx--; bFetch(bNavHistory[bHistIdx]); } };
-  window.bGoForward = function() { if (bHistIdx < bNavHistory.length - 1) { bHistIdx++; bFetch(bNavHistory[bHistIdx]); } };
-  window.bReload    = function() { if (bCurrentUrl) bFetch(bCurrentUrl); };
+  window.bGoBack    = function () {
+    const frame = bGetFrame();
+    if (frame) { try { frame.contentWindow.history.back(); return; } catch (_) {} }
+    if (bHistIdx > 0) { bHistIdx--; bLoadFrame(bNavHistory[bHistIdx]); }
+  };
+  window.bGoForward = function () {
+    const frame = bGetFrame();
+    if (frame) { try { frame.contentWindow.history.forward(); return; } catch (_) {} }
+    if (bHistIdx < bNavHistory.length - 1) { bHistIdx++; bLoadFrame(bNavHistory[bHistIdx]); }
+  };
+  window.bReload    = function () { if (bCurrentUrl) bLoadFrame(bCurrentUrl); };
+  window.bSendToRepeater = function () {
+    if (!bCurrentUrl) return toast('Load a page first');
+    repTabNew({ method:'GET', url:bCurrentUrl });
+    try { repTabs[repActiveIdx].name = new URL(bCurrentUrl).host; } catch(_) {}
+    repRenderTabs();
+    showTab('repeater');
+    toast('Sent to a new Repeater tab ✓');
+  };
 
-  // ── postMessage from iframe ──────────────────────────────────
-  window.addEventListener('message', function(e) {
-    if (!e.data || !e.data.type) return;
-    switch (e.data.type) {
-      case 'proxy-navigate':
-        if (e.data.url) bLoadUrl(e.data.url);
-        break;
-      case 'proxy-submit':
-        if (e.data.url) {
-          if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
-          bNavHistory.push(e.data.url);
-          bHistIdx = bNavHistory.length - 1;
-          bFetchWithOpts(e.data.url, {
-            method:      e.data.method || 'POST',
-            body:        e.data.body,
-            contentType: e.data.contentType || 'application/x-www-form-urlencoded',
-          });
-        }
-        break;
-    }
-  });
+  function bGetFrame() {
+    const pageContent = el('bPageContent');
+    return pageContent ? pageContent.querySelector('iframe.proxy-frame') : null;
+  }
+
+  function bRpUrl(url) {
+    return '/rp/?t=' + encodeURIComponent(url);
+  }
 
   function bLoadUrl(url) {
     if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
     bNavHistory.push(url);
     bHistIdx = bNavHistory.length - 1;
-    bFetch(url);
+    bLoadFrame(url);
   }
 
-  function bFetch(url) { bFetchWithOpts(url, { method: 'GET' }); }
-
-  // ── Core fetch ────────────────────────────────────────────────
-  async function bFetchWithOpts(url, opts) {
-    // FIX-B7: Abort any previous in-flight request
-    if (bAbortCtrl) { try { bAbortCtrl.abort(); } catch (_) {} }
-    bAbortCtrl = new AbortController();
-    const signal = bAbortCtrl.signal;
-
+  // ── Load (or reload) the reverse-proxy iframe ─────────────────
+  function bLoadFrame(url) {
     bCurrentUrl = url;
+
     const urlbar      = el('bUrlbar');
     const welcome     = el('bWelcome');
     const loadOverlay = el('bLoadOverlay');
@@ -898,243 +1115,64 @@ wsConnect();
     const statusText  = el('bStatusText');
     const loadMsg     = el('bLoadMsg');
 
-    if (urlbar)      urlbar.value                 = url;
-    if (welcome)     welcome.style.display        = 'none';
-    if (pageContent) pageContent.style.display    = 'none';
-    if (errorPane)   errorPane.style.display      = 'none';
-    if (loadOverlay) loadOverlay.style.display    = 'flex';
-    if (loadMsg)     loadMsg.textContent          = 'Connecting to ' + url + '…';
-    if (statusText)  statusText.textContent       = '';
+    if (urlbar)      urlbar.value              = url;
+    if (welcome)     welcome.style.display     = 'none';
+    if (errorPane)   errorPane.style.display   = 'none';
+    if (loadOverlay) loadOverlay.style.display = 'flex';
+    if (loadMsg)     loadMsg.textContent       = 'Connecting to ' + url + '…';
+    if (statusText)  statusText.textContent    = '';
 
     bBumpCapture();
 
-    try {
-      const fetchOpts = { method: opts.method || 'GET', headers: {}, signal };
-      if (opts.body) {
-        fetchOpts.body = opts.body;
-        fetchOpts.headers['Content-Type'] = opts.contentType || 'application/x-www-form-urlencoded';
-      }
-
-      const resp = await fetch('/proxy-browse?url=' + encodeURIComponent(url), fetchOpts);
-
-      if (signal.aborted) return; // navigated away
-
-      const finalUrl = resp.headers.get('x-final-url') || url;
-      if (finalUrl !== url) {
-        bCurrentUrl           = finalUrl;
-        bNavHistory[bHistIdx] = finalUrl;
-        if (urlbar) urlbar.value = finalUrl;
-      }
-
-      if (statusText) statusText.textContent = resp.status + ' ' + (resp.statusText || '');
-
-      const ct = (resp.headers.get('content-type') || '').split(';')[0].trim();
-
-      if (ct === 'text/html' || ct === 'text/plain' || !ct || ct === 'application/xhtml+xml') {
-        if (loadMsg) loadMsg.textContent = 'Rendering…';
-        const html = await resp.text();
-        if (!signal.aborted) bRenderHTML(html, finalUrl || url);
-
-      } else if (ct === 'application/json' || ct.includes('json')) {
-        const text = await resp.text();
-        if (!signal.aborted) bRenderJSON(text);
-
-      } else if (ct.startsWith('image/')) {
-        const blob   = await resp.blob();
-        const objUrl = URL.createObjectURL(blob);
-        if (!signal.aborted && pageContent) {
-          pageContent.innerHTML = `<div style="display:flex;align-items:center;justify-content:center;min-height:200px;background:#111;padding:16px;">
-            <img src="${objUrl}" style="max-width:100%;height:auto;border-radius:4px;">
-          </div>`;
-          bShowContent();
-        }
-
-      } else {
-        const size = resp.headers.get('content-length') || '?';
-        if (!signal.aborted && pageContent) {
-          pageContent.innerHTML = `<div style="padding:24px;font-family:monospace;background:#0a0c0f;color:#e2e8f0;min-height:100%;">
-            <h3 style="color:#22c55e;margin-bottom:8px;">Response received</h3>
-            <p style="color:#64748b;">Content-Type: ${bEsc(ct)}</p>
-            <p style="color:#64748b;">Size: ${size} bytes</p>
-            <p style="margin-top:12px;color:#94a3b8;">This content type cannot be rendered inline.</p>
-          </div>`;
-          bShowContent();
-        }
-      }
-
-    } catch (e) {
-      if (e.name === 'AbortError') return; // FIX-B7: suppress abort errors
-      if (loadOverlay) loadOverlay.style.display = 'none';
-      if (errorPane)   errorPane.style.display   = 'flex';
-      const errMsg = el('bErrorMsg');
-      if (errMsg) errMsg.textContent = e.message + '\n\nMake sure the target is reachable.';
-    }
-  }
-
-  // ── Render HTML ───────────────────────────────────────────────
-  function bRenderHTML(html, baseUrl) {
-    const pageContent = el('bPageContent');
     if (!pageContent) return;
 
-    // ── FIX-B3: Rewrite all asset URLs to /proxy-asset?url=... ──
-    // This runs server-side-style in a string before srcdoc injection.
-    // Handles: src=, href= (stylesheets/scripts), action= forms,
-    // srcset=, and inline CSS url().
-    function rewriteUrl(u) {
-      if (!u || !u.trim() || u.startsWith('data:') || u.startsWith('blob:') ||
-          u.startsWith('javascript:') || u.startsWith('#') ||
-          u.startsWith('mailto:') || u.startsWith('tel:')) return u;
-      try {
-        const abs = new URL(u.trim(), baseUrl).href;
-        return '/proxy-asset?url=' + encodeURIComponent(abs);
-      } catch (_) { return u; }
-    }
-
-    // Rewrite tag attributes
-    let srcDoc = html
-      // <script src="...">
-      .replace(/(<script\b[^>]*\s)src=(["'])([^"']+)\2/gi, (m, pre, q, u) => `${pre}src=${q}${rewriteUrl(u)}${q}`)
-      // <link href="...">
-      .replace(/(<link\b[^>]*)href=(["'])([^"']+)\2/gi, (m, pre, q, u) => {
-        // Don't rewrite canonical/alternate links — only stylesheet/icon
-        if (/rel=(["'])(stylesheet|icon|shortcut)[^"']*\2/i.test(pre) || /type=(["'])text\/css\2/i.test(pre)) {
-          return `${pre}href=${q}${rewriteUrl(u)}${q}`;
-        }
-        return m; // leave nav/canonical links for the interception script
-      })
-      // <img src="..."> <source src="..."> <audio src> <video src>
-      .replace(/(<(?:img|source|audio|video|track|embed)\b[^>]*\s)src=(["'])([^"']+)\2/gi, (m, pre, q, u) => `${pre}src=${q}${rewriteUrl(u)}${q}`)
-      // srcset="url 1x, url 2x"
-      .replace(/srcset=(["'])([^"']+)\1/gi, (m, q, val) => {
-        const rewritten = val.replace(/([^\s,]+)(\s+[\d.]+[wx])?/g, (sm, u, d) => rewriteUrl(u) + (d || ''));
-        return `srcset=${q}${rewritten}${q}`;
-      })
-      // CSS url() inside style attributes and <style> blocks
-      .replace(/url\((["']?)([^"')]+)\1\)/gi, (m, q, u) => `url(${q}${rewriteUrl(u)}${q})`);
-
-    // FIX-B5: Remove ALL existing <base> tags, then inject one correct one
-    srcDoc = srcDoc.replace(/<base\b[^>]*>/gi, '');
-    const baseTag = `<base href="${baseUrl}">`;
-    if (/<head\b[^>]*>/i.test(srcDoc)) {
-      srcDoc = srcDoc.replace(/(<head\b[^>]*>)/i, '$1' + baseTag);
-    } else if (/<html\b[^>]*>/i.test(srcDoc)) {
-      srcDoc = srcDoc.replace(/(<html\b[^>]*>)/i, '$1<head>' + baseTag + '</head>');
-    } else {
-      srcDoc = baseTag + srcDoc;
-    }
-
-    // ── FIX-B4/B6: Interception script ──────────────────────────
-    // Injected into EVERY page. Captures link clicks and form submits
-    // via capture-phase listeners (fires before site's own handlers).
-    // Uses postMessage to send nav/submit events to parent proxy UI.
-    // FIX-B4: No allow-same-origin on the iframe, so we use '*' target.
-    // FIX-B6: e.stopImmediatePropagation() prevents other site handlers
-    //          from swallowing the event before we process it.
-    const interceptScript = `<script>
-(function() {
-  var BASE = ${JSON.stringify(baseUrl)};
-  function abs(u) { try { return new URL(u, BASE).href; } catch(_) { return u; } }
-
-  // ── Link clicks ─────────────────────────────────────────────
-  document.addEventListener('click', function(e) {
-    // Walk up the DOM to find the nearest anchor
-    var el = e.target;
-    for (var i = 0; i < 5 && el; i++) {
-      if (el.tagName === 'A' && el.getAttribute('href')) break;
-      el = el.parentElement;
-    }
-    if (!el || el.tagName !== 'A') return;
-    var href = el.getAttribute('href');
-    if (!href) return;
-    // Let browser handle non-navigating hrefs
-    if (href.startsWith('#') || href.startsWith('javascript:') ||
-        href.startsWith('mailto:') || href.startsWith('tel:') ||
-        href.startsWith('data:')) return;
-    var target = el.getAttribute('target');
-    if (target && target !== '_self' && target !== '_top' && target !== '_parent') return;
-    e.preventDefault();
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-    window.parent.postMessage({ type: 'proxy-navigate', url: abs(href) }, '*');
-  }, true); // capture phase — fires before site handlers
-
-  // ── Form submits ─────────────────────────────────────────────
-  document.addEventListener('submit', function(e) {
-    var form   = e.target;
-    var method = (form.getAttribute('method') || 'GET').toUpperCase();
-    var action = abs(form.getAttribute('action') || location.href);
-    e.preventDefault();
-    e.stopPropagation();
-    e.stopImmediatePropagation();
-    if (method === 'GET') {
-      var qs = new URLSearchParams(new FormData(form)).toString();
-      window.parent.postMessage({
-        type: 'proxy-navigate',
-        url: action + (qs ? (action.includes('?') ? '&' : '?') + qs : ''),
-      }, '*');
-    } else {
-      window.parent.postMessage({
-        type:        'proxy-submit',
-        url:         action,
-        method:      method,
-        body:        new URLSearchParams(new FormData(form)).toString(),
-        contentType: 'application/x-www-form-urlencoded',
-      }, '*');
-    }
-  }, true);
-
-  // ── XHR/fetch override — redirect in-page requests through proxy ─
-  // Many SPAs use fetch/XHR for navigation. We patch them so requests
-  // go through /proxy-asset which routes via proxy.js (captured).
-  var _origFetch = window.fetch;
-  window.fetch = function(input, init) {
-    var url = (typeof input === 'string') ? input : (input.url || '');
-    try {
-      var absUrl = new URL(url, BASE).href;
-      if (absUrl.startsWith('http') && !absUrl.startsWith(location.origin)) {
-        var proxied = '/proxy-asset?url=' + encodeURIComponent(absUrl);
-        return _origFetch(proxied, init);
-      }
-    } catch(_) {}
-    return _origFetch(input, init);
-  };
-
-})();
-<\/script>`;
-
-    // Inject interception script before </body> or at the end
-    if (/<\/body>/i.test(srcDoc)) {
-      srcDoc = srcDoc.replace(/<\/body>/i, interceptScript + '</body>');
-    } else {
-      srcDoc += interceptScript;
-    }
-
-    // Clear old frame
-    var old = pageContent.querySelector('iframe.proxy-frame');
+    // Swap in a fresh iframe for every top-level navigation so a page
+    // that hangs or errors doesn't leave the old page's content behind.
+    const old = pageContent.querySelector('iframe.proxy-frame');
     if (old) old.remove();
 
-    // FIX-B4: Remove allow-same-origin — it caused postMessage mismatches.
-    // Scripts still work (allow-scripts), forms work (allow-forms),
-    // popups work (allow-popups). allow-same-origin is NOT included.
-    var frame = document.createElement('iframe');
+    const frame = document.createElement('iframe');
     frame.className = 'proxy-frame';
-    frame.setAttribute('sandbox', 'allow-scripts allow-forms allow-popups allow-modals allow-presentation');
+    // No sandbox: the reverse-proxy page is served from our own origin,
+    // so there is no cross-origin isolation to enforce here, and full
+    // capability (same-origin, scripts, forms, popups) is required for
+    // sites to behave like they would in a normal browser tab.
     frame.style.cssText = 'width:100%;height:100%;border:none;display:block;background:#fff;';
-    frame.srcdoc = srcDoc;
+    frame.src = bRpUrl(url);
+
+    let settled = false;
+    frame.addEventListener('load', function () {
+      settled = true;
+      bShowContent();
+    });
+
+    // Safety net: if the iframe never fires 'load' (e.g. the origin server
+    // never responds and our own fetch-timeout inside ui-server.js is what
+    // eventually returns the 502 error page — which itself fires 'load'),
+    // this timeout just guards against an indefinitely stuck spinner.
+    setTimeout(function () {
+      if (!settled && bCurrentUrl === url) bShowContent();
+    }, 31000);
+
     pageContent.style.cssText = 'display:block;width:100%;height:100%;padding:0;overflow:hidden;';
     pageContent.appendChild(frame);
-
-    bShowContent();
   }
 
-  function bRenderJSON(text) {
-    const pageContent = el('bPageContent');
-    if (!pageContent) return;
-    let pretty = text;
-    try { pretty = JSON.stringify(JSON.parse(text), null, 2); } catch (_) {}
-    pageContent.innerHTML = `<pre style="padding:16px;font-family:monospace;font-size:12px;background:#0a0c0f;color:#e2e8f0;white-space:pre-wrap;word-break:break-all;min-height:100%;">${bEsc(pretty)}</pre>`;
-    bShowContent();
-  }
+  // ── Address-bar sync from the JS shim injected into every page ─
+  // server/ui-server.js's buildJSShim() posts this on load and on
+  // <title> mutation so the address bar reflects the real URL even
+  // after in-page navigation (SPA routing, redirects, etc.).
+  window.addEventListener('message', function (e) {
+    if (!e.data || e.data.type !== 'rp-title' || !e.data.url) return;
+    const urlbar = el('bUrlbar');
+    bCurrentUrl = e.data.url;
+    if (urlbar) urlbar.value = e.data.url;
+    if (bNavHistory[bHistIdx] !== e.data.url) {
+      if (bHistIdx < bNavHistory.length - 1) bNavHistory = bNavHistory.slice(0, bHistIdx + 1);
+      bNavHistory.push(e.data.url);
+      bHistIdx = bNavHistory.length - 1;
+    }
+  });
 
   function bShowContent() {
     const loadOverlay = el('bLoadOverlay');
@@ -1144,11 +1182,7 @@ wsConnect();
     if (loadOverlay) loadOverlay.style.display = 'none';
     if (errorPane)   errorPane.style.display   = 'none';
     if (pageContent) pageContent.style.display = 'block';
-    if (pageWrap)    pageWrap.scrollTop        = 0;
-  }
-
-  function bEsc(s) {
-    return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    if (pageWrap)    pageWrap.scrollTop         = 0;
   }
 
   function bBumpCapture() {
